@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -81,6 +82,100 @@ def fmt_pct(x: float) -> str:
     if pd.isna(x):
         return ""
     return f"{x * 100:.2f}%"
+
+
+# =========================
+# Health helpers
+# =========================
+def _human_size(n_bytes: int) -> str:
+    if n_bytes is None:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    v = float(n_bytes)
+    for u in units:
+        if v < 1024.0 or u == units[-1]:
+            return f"{v:.1f} {u}"
+        v /= 1024.0
+    return f"{n_bytes} B"
+
+
+def _file_meta(path: Path) -> dict:
+    if not path.exists():
+        return {
+            "file": str(path),
+            "exists": False,
+            "size": "",
+            "modified": "",
+        }
+    stt = path.stat()
+    # local time display
+    mtime = datetime.fromtimestamp(stt.st_mtime)
+    return {
+        "file": str(path),
+        "exists": True,
+        "size": _human_size(int(stt.st_size)),
+        "modified": mtime.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _df_span(df: pd.DataFrame, date_col: str) -> str:
+    if df is None or df.empty or date_col not in df.columns:
+        return ""
+    s = pd.to_datetime(df[date_col], errors="coerce").dropna()
+    if s.empty:
+        return ""
+    return f"{s.min().date()} → {s.max().date()} ({s.nunique()} periods)"
+
+
+def render_health_panel(
+    scores: pd.DataFrame,
+    factors: pd.DataFrame,
+    snapshots: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    bt: pd.DataFrame,
+    prices: pd.DataFrame,
+    ai_w: pd.DataFrame,
+) -> None:
+    with st.expander("🩺 Health", expanded=True):
+        # File-level health (fast, does not require successful reads)
+        files = [
+            ("scores_monthly", SCORES_PATH),
+            ("factors_monthly", FACTORS_PATH),
+            ("snapshots_monthly", SNAPSHOTS_PATH),
+            ("ai_weights_monthly", AI_WEIGHTS_PATH),
+            ("portfolio_monthly", PORTFOLIO_PATH),
+            ("backtest_monthly", BACKTEST_PATH),
+            ("prices_daily", PRICES_PATH),
+        ]
+        meta = pd.DataFrame([{**{"name": n}, **_file_meta(p)} for n, p in files])
+        st_df(meta[["name", "exists", "size", "modified", "file"]], stretch=True, height=260)
+
+        # Dataset-level health (only if loaded)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Universe tickers", f"{scores['ticker'].nunique():,}" if (not scores.empty and "ticker" in scores.columns) else "")
+        with c2:
+            st.metric("Scores rows", f"{len(scores):,}" if scores is not None else "")
+        with c3:
+            st.metric("Backtest months", f"{len(bt):,}" if bt is not None else "")
+        with c4:
+            st.metric("Portfolio rows", f"{len(portfolio):,}" if portfolio is not None else "")
+
+        spans = []
+        spans.append({"table": "scores", "span": _df_span(scores, "asof_date")})
+        spans.append({"table": "factors", "span": _df_span(factors, "asof_date")})
+        spans.append({"table": "snapshots", "span": _df_span(snapshots, "asof_date")})
+        spans.append({"table": "ai_weights", "span": _df_span(ai_w, "asof_date")})
+        spans.append({"table": "portfolio", "span": _df_span(portfolio, "asof_date")})
+        spans.append({"table": "backtest", "span": _df_span(bt, "trade_date")})
+        spans.append({"table": "prices", "span": _df_span(prices, "date")})
+        spans_df = pd.DataFrame(spans)
+        st_df(spans_df, stretch=True, height=240)
+
+        st.caption(
+            "Tip: If the page loads but charts look empty, check file existence + date spans above. "
+            "Most issues are missing parquets or a mismatch in date range between scores/backtest."
+        )
 
 
 # =========================
@@ -284,6 +379,9 @@ def main() -> None:
     bt = load_parquet(BACKTEST_PATH)
     prices = load_parquet(PRICES_PATH)
     ai_w = load_parquet(AI_WEIGHTS_PATH)
+
+    # ✅ Quick Health panel (shows file status + spans)
+    render_health_panel(scores, factors, snapshots, portfolio, bt, prices, ai_w)
 
     # Basic checks
     if scores.empty or portfolio.empty or bt.empty:
