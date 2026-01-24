@@ -368,8 +368,8 @@ def add_contrib_and_deltas(scores: pd.DataFrame) -> pd.DataFrame:
 # Main UI
 # =========================
 def main() -> None:
-    st.set_page_config(page_title="Quant Factor MVP Dashboard", layout="wide")
-    st.title("Quant Factor Rating — MVP Dashboard")
+    st.set_page_config(page_title="Quant Factor Rating Dashboard", layout="wide")
+    st.title("Quant Factor Rating — Dashboard")
 
     # Load datasets
     scores = load_parquet(SCORES_PATH)
