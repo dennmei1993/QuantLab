@@ -4,11 +4,21 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import time
+import json
+import hashlib
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import requests
+
+def normalize_fmp_symbol(ticker: str) -> str:
+    # Convert dot-class to dash-class or parent
+    t = ticker.upper()
+    if t == "BRK.B":
+        return "BRK-A"   # or "BRK.A" depending on FMP endpoint
+    if t == "BF.B":
+        return "BF-A"
+    return t
 
 
 @dataclass
@@ -25,31 +35,32 @@ class FMPAdapter:
         FMP_API_KEY
 
     Optional env vars:
-        FMP_LIMIT   (quarters to request per statement; default 24 ~ 6 years buffer)
-        FMP_RPM     (requests per minute; overrides requests_per_minute)
-
-    Notes:
-    - FMP provides filing/accepted dates for many tickers; we use those as point-in-time 'available_date'.
-    - If filing/accepted dates are missing, we fall back to period_end + availability_lag_days.
+        FMP_LIMIT               (quarters to request per statement; default 24 ~ 6 years buffer)
+        FMP_RPM                 (requests per minute; overrides requests_per_minute)
+        FMP_USE_HTTP_CACHE      (0/1, default 1) cache raw HTTP JSON responses to disk
+        FMP_HTTP_CACHE_DAYS     (default 7) max age for cached HTTP responses
     """
 
     cache_dir: Path
     api_key_env: str = "FMP_API_KEY"
     base_url: str = "https://financialmodelingprep.com/stable"
 
-
     # Throttle (can override via env FMP_RPM)
     requests_per_minute: int = 50
 
-    # If your plan only supports ~5y history, keep this ~24 quarters (6y buffer)
+    # ~24 quarters = 6y buffer
     statement_limit: int = 24
 
     availability_lag_days: int = 45
-
     max_retries: int = 8
+
+    # HTTP response cache settings (disk)
+    use_http_cache: bool = True
+    http_cache_days: int = 7
 
     def __post_init__(self) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "http_cache").mkdir(parents=True, exist_ok=True)
 
         # Optional overrides
         rpm_env = os.getenv("FMP_RPM")
@@ -66,13 +77,22 @@ class FMPAdapter:
             except ValueError:
                 pass
 
+        use_cache_env = os.getenv("FMP_USE_HTTP_CACHE")
+        if use_cache_env is not None:
+            self.use_http_cache = bool(int(use_cache_env))
+
+        cache_days_env = os.getenv("FMP_HTTP_CACHE_DAYS")
+        if cache_days_env:
+            try:
+                self.http_cache_days = max(0, int(cache_days_env))
+            except ValueError:
+                pass
+
     @property
     def api_key(self) -> str:
         key = os.getenv(self.api_key_env)
         if not key:
-            raise RuntimeError(
-                f"Missing {self.api_key_env}. Set it as an environment variable."
-            )
+            raise RuntimeError(f"Missing {self.api_key_env}. Set it as an environment variable.")
         return key
 
     def _throttle(self) -> None:
@@ -80,12 +100,55 @@ class FMPAdapter:
             return
         time.sleep(60.0 / float(self.requests_per_minute))
 
-    
-    def _get(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    # -------------------------
+    # Disk cache helpers
+    # -------------------------
+    def _cache_key(self, url: str, params: dict[str, Any]) -> str:
+        # Stable hash so filenames are safe and short
+        payload = {"url": url, "params": params}
+        s = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha1(s).hexdigest()
+
+    def _cache_path(self, key: str) -> Path:
+        return self.cache_dir / "http_cache" / f"{key}.json"
+
+    def _cache_is_fresh(self, p: Path) -> bool:
+        if not p.exists():
+            return False
+        if self.http_cache_days <= 0:
+            return False
+        age_seconds = time.time() - p.stat().st_mtime
+        return age_seconds <= (self.http_cache_days * 86400)
+
+    def _cache_read(self, p: Path) -> list[dict[str, Any]]:
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, list) else []
+        except Exception:
+            return []
+
+    def _cache_write(self, p: Path, payload: Any) -> None:
+        try:
+            p.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception:
+            # cache failures should never crash the pipeline
+            pass
+
+    # -------------------------
+    # HTTP
+    # -------------------------
+    def _get(self, path: str, params: dict[str, Any], *, force_refresh: bool = False) -> list[dict[str, Any]]:
         params = dict(params)
         params["apikey"] = self.api_key
 
         url = self.base_url.rstrip("/") + "/" + path.lstrip("/")
+
+        # Disk cache (raw JSON list)
+        if self.use_http_cache and not force_refresh:
+            key = self._cache_key(url, params)
+            cp = self._cache_path(key)
+            if self._cache_is_fresh(cp):
+                return self._cache_read(cp)
 
         last_text = ""
         for attempt in range(1, int(getattr(self, "max_retries", 8)) + 1):
@@ -95,7 +158,12 @@ class FMPAdapter:
 
             if resp.status_code == 200:
                 payload = resp.json()
-                return payload if isinstance(payload, list) else []
+                payload_list = payload if isinstance(payload, list) else []
+                # write cache even on forced refresh so later runs are fast
+                if self.use_http_cache:
+                    key = self._cache_key(url, params)
+                    self._cache_write(self._cache_path(key), payload_list)
+                return payload_list
 
             # Rate limit: exponential backoff
             if resp.status_code == 429:
@@ -103,17 +171,18 @@ class FMPAdapter:
                 print(f"[FMP] 429 rate limit. Backing off {wait}s (attempt {attempt})")
                 time.sleep(wait)
                 continue
-        # Temporary server/network issues: retry
+
+            # Temporary server/network issues: retry
             if resp.status_code in (500, 502, 503, 504):
                 wait = min(30, 2 ** attempt)
                 print(f"[FMP] {resp.status_code} server error. Retrying in {wait}s (attempt {attempt})")
                 time.sleep(wait)
                 continue
-        # Hard failure: raise
+
+            # Hard failure
             raise RuntimeError(f"FMP API error {resp.status_code}: {last_text}")
 
         raise RuntimeError(f"FMP API retry exhausted. Last response: {last_text}")
-
 
     @staticmethod
     def _to_float(x: Any) -> float:
@@ -137,28 +206,47 @@ class FMPAdapter:
         return pd.NaT
 
     def _fetch_quarterly_statements(
-        self, ticker: str
+        self,
+        ticker: str,
+        statement_limit: int | None = None,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        # API paths use /v3; keep base_url '/api' and include /v3 prefix.
-        common = {"symbol": ticker, "period": "quarter", "limit": int(self.statement_limit)}
-        inc = self._get("income-statement", common)
-        bs  = self._get("balance-sheet-statement", common)
-        cf  = self._get("cash-flow-statement", common)
+        limit = int(statement_limit) if statement_limit is not None else int(self.statement_limit)
+        symbol = normalize_fmp_symbol(ticker)
+        common = {"symbol": symbol, "period": "quarter", "limit": limit}
 
+        inc = self._get("income-statement", common, force_refresh=force_refresh)
+        bs  = self._get("balance-sheet-statement", common, force_refresh=force_refresh)
+        cf  = self._get("cash-flow-statement", common, force_refresh=force_refresh)
         return inc, bs, cf
 
-    def fetch_fundamentals_quarterly(self, tickers: list[str]) -> pd.DataFrame:
+    def fetch_fundamentals_quarterly(
+        self,
+        tickers: list[str],
+        statement_limit: int | None = None,
+        *,
+        force_refresh: bool = False,
+        progress_every: int = 50,
+    ) -> pd.DataFrame:
+        """Fetch quarterly fundamentals for tickers.
+
+        force_refresh=True bypasses disk HTTP cache (still throttles / respects API limits).
+        """
         rows: list[dict[str, Any]] = []
         errors = 0
 
-        for t in tickers:
+        for i, t in enumerate(tickers, start=1):
+            if progress_every and (i == 1 or i % progress_every == 0):
+                print(f"[FMP] fundamentals: {i}/{len(tickers)} tickers...")
+
             try:
-                inc, bs, cf = self._fetch_quarterly_statements(t)
+                inc, bs, cf = self._fetch_quarterly_statements(
+                    t, statement_limit=statement_limit, force_refresh=force_refresh
+                )
 
                 # Index by period_end ("date" field)
-                def index_by_date(
-                    lst: list[dict[str, Any]]
-                ) -> dict[pd.Timestamp, dict[str, Any]]:
+                def index_by_date(lst: list[dict[str, Any]]) -> dict[pd.Timestamp, dict[str, Any]]:
                     out: dict[pd.Timestamp, dict[str, Any]] = {}
                     for r in lst:
                         d = r.get("date")
@@ -201,53 +289,40 @@ class FMPAdapter:
 
                     operating_cf = self._to_float(r_cf.get("operatingCashFlow"))
                     capex = self._to_float(r_cf.get("capitalExpenditure"))
-
-                    free_cf = float("nan")
-                    if np.isfinite(operating_cf) and np.isfinite(capex):
-                        # FMP capex is usually negative; keep sign-consistent with your pipeline:
-                        # free_cash_flow = OCF - capex
-                        free_cf = operating_cf - capex
+                    fcf = operating_cf - capex if pd.notna(operating_cf) and pd.notna(capex) else float("nan")
 
                     rows.append(
-                        {
-                            "ticker": str(t),
-                            "period_end": pe,
-                            "filing_date": filing_date,
-                            "available_date": pd.to_datetime(available_date).normalize(),
-                            "revenue": revenue,
-                            "net_income": net_income,
-                            "cogs": cogs,
-                            "total_assets": total_assets,
-                            "total_liabilities": total_liabilities,
-                            "equity": equity,
-                            "operating_cash_flow": operating_cf,
-                            "capital_expenditures": capex,
-                            "free_cash_flow": free_cf,
-                        }
+                        dict(
+                            ticker=str(t).upper(),
+                            period_end=pe,
+                            filing_date=filing_date,
+                            available_date=available_date,
+                            revenue=revenue,
+                            net_income=net_income,
+                            cogs=cogs,
+                            total_assets=total_assets,
+                            total_liabilities=total_liabilities,
+                            equity=equity,
+                            operating_cash_flow=operating_cf,
+                            capital_expenditures=capex,
+                            free_cash_flow=fcf,
+                        )
                     )
-
             except Exception as e:
                 errors += 1
-                if errors <= 10:
-                    print(f"[FMP] {t}: ERROR {type(e).__name__}: {e}")
+                if errors <= 15:
+                    print(f"[FMP] {t}: fundamentals fetch failed: {e}")
                 continue
 
-        if not rows:
-            raise RuntimeError(
-                "FMP fundamentals returned 0 rows (all tickers failed). "
-                "Check FMP_API_KEY, endpoint access, and plan limits. "
-                "First errors were printed above."
-            )
-
         df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+
+        # Basic cleanup / ordering
+        df["ticker"] = df["ticker"].astype(str).str.upper()
         df["period_end"] = pd.to_datetime(df["period_end"]).dt.normalize()
-        df["available_date"] = pd.to_datetime(df["available_date"]).dt.normalize()
-        if "filing_date" in df.columns:
-            df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce").dt.normalize()
+        df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce").dt.normalize()
+        df["available_date"] = pd.to_datetime(df["available_date"], errors="coerce").dt.normalize()
 
-        # Deduplicate if any duplicates due to statement overlap
-        df = df.sort_values(["ticker", "period_end", "available_date"]).drop_duplicates(
-            subset=["ticker", "period_end"], keep="last"
-        )
-
-        return df.sort_values(["ticker", "period_end"]).reset_index(drop=True)
+        df = df.sort_values(["ticker", "period_end"]).reset_index(drop=True)
+        return df

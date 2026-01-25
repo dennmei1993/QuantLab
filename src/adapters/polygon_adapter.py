@@ -10,6 +10,12 @@ from typing import Any, Optional
 import pandas as pd
 import requests
 
+from datetime import datetime
+
+
+
+
+
 
 @dataclass
 class PolygonAdapter:
@@ -31,6 +37,32 @@ class PolygonAdapter:
     base_url: str = "https://api.polygon.io"
     requests_per_minute: int = 30
     max_retries: int = 10
+
+    def _record_empty_ticker(self, ticker: str) -> None:
+        """Append ticker to data/universe/empty_tickers.csv if not already present."""
+        universe_dir = self.cache_dir.parents[1] / "universe"  # data/universe
+        universe_dir.mkdir(parents=True, exist_ok=True)
+        path = universe_dir / "empty_tickers.csv"
+
+        t = str(ticker).strip().upper()
+        existing: set[str] = set()
+
+        if os.path.exists(path):
+            try:
+                df0 = pd.read_csv(path)
+                if "ticker" in df0.columns:
+                    existing = set(df0["ticker"].astype(str).str.strip().str.upper())
+            except Exception:
+                # If the file is malformed, we treat as empty and keep going.
+                existing = set()
+
+        if t and t not in existing:
+            pd.DataFrame({"ticker": [t]}).to_csv(
+                path,
+                mode="a" if os.path.exists(path) else "w",
+                header=not os.path.exists(path),
+                index=False,
+            )
 
     def __post_init__(self) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +266,7 @@ class PolygonAdapter:
             df_new = self._fetch_one_ticker_range(t, start_s, end_s, adjusted)
             if df_new.empty:
                 print(f"[Polygon] {t}: empty response for {start_s}..{end_s}")
+                self._record_empty_ticker(t)
                 continue
 
             if use_cache:
