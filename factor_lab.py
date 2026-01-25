@@ -72,10 +72,18 @@ def unique_cols(cols: list[str]) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def load_parquet(path: Path) -> pd.DataFrame:
+
+def load_parquet(path_str: str, mtime: float) -> pd.DataFrame:
+    path = Path(path_str)
     if not path.exists():
         return pd.DataFrame()
     return pd.read_parquet(path)
+
+def load_parquet_file(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    return load_parquet(str(path), path.stat().st_mtime)
+
 
 
 def fmt_pct(x: float) -> str:
@@ -371,8 +379,12 @@ def main() -> None:
     st.set_page_config(page_title="Quant Factor Rating Dashboard", layout="wide")
     st.title("Quant Factor Rating — Dashboard")
 
+    if st.sidebar.button("Clear cache"):
+        st.cache_data.clear()
+        st.rerun()
+
     # Load datasets
-    scores = load_parquet(SCORES_PATH)
+    scores = load_parquet_file(SCORES_PATH)
     factors = load_parquet(FACTORS_PATH)
     snapshots = load_parquet(SNAPSHOTS_PATH)
     portfolio = load_parquet(PORTFOLIO_PATH)
