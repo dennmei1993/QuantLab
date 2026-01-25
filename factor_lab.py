@@ -46,16 +46,6 @@ AI_WCOLS = {
     "risk_score": "w_risk_score",
 }
 
-UNIVERSE_PATH = DATA_DIR / "universe" / "us_tickers.csv"
-
-def load_universe(path: Path) -> int:
-    if not path.exists():
-        return 0
-    df = pd.read_csv(path)
-    if "ticker" not in df.columns:
-        return 0
-    return df["ticker"].astype(str).str.upper().str.strip().nunique()
-
 
 # =========================
 # Streamlit compat dataframe wrapper
@@ -82,20 +72,18 @@ def unique_cols(cols: list[str]) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-
-def load_parquet(path_str: str, mtime: float) -> pd.DataFrame:
+def _load_parquet_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    """Read a parquet file with cache invalidation via file mtime."""
     path = Path(path_str)
     if not path.exists():
         return pd.DataFrame()
     return pd.read_parquet(path)
 
 def load_parquet_file(path: Path) -> pd.DataFrame:
+    """Convenience wrapper: passes file mtime into the cached reader."""
     if not path.exists():
         return pd.DataFrame()
-    return load_parquet(str(path), path.stat().st_mtime)
-
-
-
+    return _load_parquet_cached(str(path), path.stat().st_mtime)
 def fmt_pct(x: float) -> str:
     if pd.isna(x):
         return ""
@@ -171,8 +159,7 @@ def render_health_panel(
         # Dataset-level health (only if loaded)
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("Universe (CSV)", f"{load_universe(UNIVERSE_PATH):,}")
-            st.metric("Universe (scores)", f"{scores['ticker'].nunique():,}" if (not scores.empty and "ticker" in scores.columns) else "")
+            st.metric("Universe tickers", f"{scores['ticker'].nunique():,}" if (not scores.empty and "ticker" in scores.columns) else "")
         with c2:
             st.metric("Scores rows", f"{len(scores):,}" if scores is not None else "")
         with c3:
@@ -387,22 +374,22 @@ def add_contrib_and_deltas(scores: pd.DataFrame) -> pd.DataFrame:
 # Main UI
 # =========================
 def main() -> None:
-    st.set_page_config(page_title="Quant Factor Rating Dashboard", layout="wide")
-    st.title("Quant Factor Rating — Dashboard")
-
+    # Quick troubleshooting: allow clearing Streamlit cache
     if st.sidebar.button("Clear cache"):
         st.cache_data.clear()
         st.rerun()
 
+    st.set_page_config(page_title="Quant Factor Rating Dashboard", layout="wide")
+    st.title("Quant Factor Rating — Dashboard")
+
     # Load datasets
     scores = load_parquet_file(SCORES_PATH)
-
-    factors = load_parquet(FACTORS_PATH)
-    snapshots = load_parquet(SNAPSHOTS_PATH)
-    portfolio = load_parquet(PORTFOLIO_PATH)
-    bt = load_parquet(BACKTEST_PATH)
-    prices = load_parquet(PRICES_PATH)
-    ai_w = load_parquet(AI_WEIGHTS_PATH)
+    factors = load_parquet_file(FACTORS_PATH)
+    snapshots = load_parquet_file(SNAPSHOTS_PATH)
+    portfolio = load_parquet_file(PORTFOLIO_PATH)
+    bt = load_parquet_file(BACKTEST_PATH)
+    prices = load_parquet_file(PRICES_PATH)
+    ai_w = load_parquet_file(AI_WEIGHTS_PATH)
 
     # ✅ Quick Health panel (shows file status + spans)
     render_health_panel(scores, factors, snapshots, portfolio, bt, prices, ai_w)
