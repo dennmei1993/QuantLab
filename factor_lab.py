@@ -385,6 +385,7 @@ def main() -> None:
 
     # Load datasets
     scores = load_parquet_file(SCORES_PATH)
+
     factors = load_parquet(FACTORS_PATH)
     snapshots = load_parquet(SNAPSHOTS_PATH)
     portfolio = load_parquet(PORTFOLIO_PATH)
