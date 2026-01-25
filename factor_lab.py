@@ -46,6 +46,16 @@ AI_WCOLS = {
     "risk_score": "w_risk_score",
 }
 
+UNIVERSE_PATH = DATA_DIR / "universe" / "us_tickers.csv"
+
+def load_universe(path: Path) -> int:
+    if not path.exists():
+        return 0
+    df = pd.read_csv(path)
+    if "ticker" not in df.columns:
+        return 0
+    return df["ticker"].astype(str).str.upper().str.strip().nunique()
+
 
 # =========================
 # Streamlit compat dataframe wrapper
@@ -161,7 +171,8 @@ def render_health_panel(
         # Dataset-level health (only if loaded)
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("Universe tickers", f"{scores['ticker'].nunique():,}" if (not scores.empty and "ticker" in scores.columns) else "")
+            st.metric("Universe (CSV)", f"{load_universe(UNIVERSE_PATH):,}")
+            st.metric("Universe (scores)", f"{scores['ticker'].nunique():,}" if (not scores.empty and "ticker" in scores.columns) else "")
         with c2:
             st.metric("Scores rows", f"{len(scores):,}" if scores is not None else "")
         with c3:
