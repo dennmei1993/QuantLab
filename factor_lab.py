@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -24,6 +23,9 @@ AI_WEIGHTS_PATH = FEATURES_DIR / "ai_weights_monthly.parquet"
 PORTFOLIO_PATH = BACKTESTS_DIR / "portfolio_monthly.parquet"
 BACKTEST_PATH = BACKTESTS_DIR / "backtest_monthly.parquet"
 PRICES_PATH = CURATED_DIR / "prices_daily.parquet"
+
+# Universe (ticker metadata: STOCK/ETF, theme)
+UNIVERSE_CSV_PATH = DATA_DIR / "universe" / "us_tickers.csv"
 
 
 # =========================
@@ -72,116 +74,60 @@ def unique_cols(cols: list[str]) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def _load_parquet_cached(path_str: str, mtime: float) -> pd.DataFrame:
-    """Read a parquet file with cache invalidation via file mtime."""
-    path = Path(path_str)
+def load_parquet(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     return pd.read_parquet(path)
 
-def load_parquet_file(path: Path) -> pd.DataFrame:
-    """Convenience wrapper: passes file mtime into the cached reader."""
+
+def fmt_pct(x, digits: int = 1) -> str:
+    """Format a decimal (e.g., 0.274) as percent string (e.g., 27.4%)."""
+    try:
+        if x is None:
+            return "—"
+        # pandas/numpy NaN handling
+        import math
+        if isinstance(x, float) and math.isnan(x):
+            return "—"
+    except Exception:
+        pass
+    try:
+        return f"{float(x) * 100:.{digits}f}%"
+    except Exception:
+        return "—"
+
+@st.cache_data(show_spinner=False)
+def load_universe_csv(path: Path) -> pd.DataFrame:
+    """Load data/universe/us_tickers.csv with columns: ticker, asset_type (STOCK|ETF), optional theme."""
     if not path.exists():
-        return pd.DataFrame()
-    return _load_parquet_cached(str(path), path.stat().st_mtime)
-def fmt_pct(x: float) -> str:
-    if pd.isna(x):
-        return ""
-    return f"{x * 100:.2f}%"
+        return pd.DataFrame(columns=["ticker", "asset_type", "theme"])
+    df = pd.read_csv(path)
+    if "ticker" not in df.columns:
+        return pd.DataFrame(columns=["ticker", "asset_type", "theme"])
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+
+    if "asset_type" not in df.columns:
+        df["asset_type"] = "STOCK"
+    df["asset_type"] = df["asset_type"].astype(str).str.strip().str.upper()
+    df = df[df["asset_type"].isin(["STOCK", "ETF"])]
+
+    if "theme" not in df.columns:
+        df["theme"] = ""
+    df["theme"] = df["theme"].fillna("").astype(str).str.strip()
+
+    df = df[df["ticker"].notna() & (df["ticker"] != "")]
+    df = df.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
+    return df[["ticker", "asset_type", "theme"]]
 
 
-# =========================
-# Health helpers
-# =========================
-def _human_size(n_bytes: int) -> str:
-    if n_bytes is None:
-        return ""
-    units = ["B", "KB", "MB", "GB", "TB"]
-    v = float(n_bytes)
-    for u in units:
-        if v < 1024.0 or u == units[-1]:
-            return f"{v:.1f} {u}"
-        v /= 1024.0
-    return f"{n_bytes} B"
+def apply_universe_meta(df: pd.DataFrame, uni: pd.DataFrame) -> pd.DataFrame:
+    """Left-join asset_type/theme onto any dataframe with a ticker column."""
+    if df is None or df.empty or "ticker" not in df.columns or uni is None or uni.empty:
+        return df
+    out = df.copy()
+    out["ticker"] = out["ticker"].astype(str).str.strip().str.upper()
+    return out.merge(uni, on="ticker", how="left")
 
-
-def _file_meta(path: Path) -> dict:
-    if not path.exists():
-        return {
-            "file": str(path),
-            "exists": False,
-            "size": "",
-            "modified": "",
-        }
-    stt = path.stat()
-    # local time display
-    mtime = datetime.fromtimestamp(stt.st_mtime)
-    return {
-        "file": str(path),
-        "exists": True,
-        "size": _human_size(int(stt.st_size)),
-        "modified": mtime.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-
-def _df_span(df: pd.DataFrame, date_col: str) -> str:
-    if df is None or df.empty or date_col not in df.columns:
-        return ""
-    s = pd.to_datetime(df[date_col], errors="coerce").dropna()
-    if s.empty:
-        return ""
-    return f"{s.min().date()} → {s.max().date()} ({s.nunique()} periods)"
-
-
-def render_health_panel(
-    scores: pd.DataFrame,
-    factors: pd.DataFrame,
-    snapshots: pd.DataFrame,
-    portfolio: pd.DataFrame,
-    bt: pd.DataFrame,
-    prices: pd.DataFrame,
-    ai_w: pd.DataFrame,
-) -> None:
-    with st.expander("🩺 Health", expanded=True):
-        # File-level health (fast, does not require successful reads)
-        files = [
-            ("scores_monthly", SCORES_PATH),
-            ("factors_monthly", FACTORS_PATH),
-            ("snapshots_monthly", SNAPSHOTS_PATH),
-            ("ai_weights_monthly", AI_WEIGHTS_PATH),
-            ("portfolio_monthly", PORTFOLIO_PATH),
-            ("backtest_monthly", BACKTEST_PATH),
-            ("prices_daily", PRICES_PATH),
-        ]
-        meta = pd.DataFrame([{**{"name": n}, **_file_meta(p)} for n, p in files])
-        st_df(meta[["name", "exists", "size", "modified", "file"]], stretch=True, height=260)
-
-        # Dataset-level health (only if loaded)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Universe tickers", f"{scores['ticker'].nunique():,}" if (not scores.empty and "ticker" in scores.columns) else "")
-        with c2:
-            st.metric("Scores rows", f"{len(scores):,}" if scores is not None else "")
-        with c3:
-            st.metric("Backtest months", f"{len(bt):,}" if bt is not None else "")
-        with c4:
-            st.metric("Portfolio rows", f"{len(portfolio):,}" if portfolio is not None else "")
-
-        spans = []
-        spans.append({"table": "scores", "span": _df_span(scores, "asof_date")})
-        spans.append({"table": "factors", "span": _df_span(factors, "asof_date")})
-        spans.append({"table": "snapshots", "span": _df_span(snapshots, "asof_date")})
-        spans.append({"table": "ai_weights", "span": _df_span(ai_w, "asof_date")})
-        spans.append({"table": "portfolio", "span": _df_span(portfolio, "asof_date")})
-        spans.append({"table": "backtest", "span": _df_span(bt, "trade_date")})
-        spans.append({"table": "prices", "span": _df_span(prices, "date")})
-        spans_df = pd.DataFrame(spans)
-        st_df(spans_df, stretch=True, height=240)
-
-        st.caption(
-            "Tip: If the page loads but charts look empty, check file existence + date spans above. "
-            "Most issues are missing parquets or a mismatch in date range between scores/backtest."
-        )
 
 
 # =========================
@@ -374,25 +320,25 @@ def add_contrib_and_deltas(scores: pd.DataFrame) -> pd.DataFrame:
 # Main UI
 # =========================
 def main() -> None:
-    # Quick troubleshooting: allow clearing Streamlit cache
-    if st.sidebar.button("Clear cache"):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.set_page_config(page_title="Quant Factor Rating Dashboard", layout="wide")
-    st.title("Quant Factor Rating — Dashboard")
+    st.set_page_config(page_title="Quant Factor MVP Dashboard", layout="wide")
+    st.title("Quant Factor Rating — MVP Dashboard")
 
     # Load datasets
-    scores = load_parquet_file(SCORES_PATH)
-    factors = load_parquet_file(FACTORS_PATH)
-    snapshots = load_parquet_file(SNAPSHOTS_PATH)
-    portfolio = load_parquet_file(PORTFOLIO_PATH)
-    bt = load_parquet_file(BACKTEST_PATH)
-    prices = load_parquet_file(PRICES_PATH)
-    ai_w = load_parquet_file(AI_WEIGHTS_PATH)
+    scores = load_parquet(SCORES_PATH)
+    factors = load_parquet(FACTORS_PATH)
+    snapshots = load_parquet(SNAPSHOTS_PATH)
+    portfolio = load_parquet(PORTFOLIO_PATH)
+    bt = load_parquet(BACKTEST_PATH)
+    prices = load_parquet(PRICES_PATH)
+    ai_w = load_parquet(AI_WEIGHTS_PATH)
 
-    # ✅ Quick Health panel (shows file status + spans)
-    render_health_panel(scores, factors, snapshots, portfolio, bt, prices, ai_w)
+    # Load universe metadata (STOCK/ETF + theme) and attach to datasets
+    universe = load_universe_csv(UNIVERSE_CSV_PATH)
+    scores = apply_universe_meta(scores, universe)
+    factors = apply_universe_meta(factors, universe)
+    snapshots = apply_universe_meta(snapshots, universe)
+    portfolio = apply_universe_meta(portfolio, universe)
+    prices = apply_universe_meta(prices, universe)
 
     # Basic checks
     if scores.empty or portfolio.empty or bt.empty:
@@ -426,7 +372,40 @@ def main() -> None:
 
     # Sidebar controls
     st.sidebar.header("Controls")
+
+    # Asset type / theme filters (for STOCK + ETF universes)
+    chosen_asset_types = ["STOCK", "ETF"]
+    if "asset_type" in scores_enriched.columns and not scores_enriched.empty:
+        present = sorted([str(x).strip().upper() for x in scores_enriched["asset_type"].dropna().unique().tolist()])
+        present = [x for x in present if x in ["STOCK", "ETF"]]
+        if present:
+            chosen_asset_types = present
+
+    chosen_asset_types = st.sidebar.multiselect(
+        "Asset type",
+        options=["STOCK", "ETF"],
+        default=chosen_asset_types,
+    )
+
+    themes = []
+    if "theme" in scores_enriched.columns and not scores_enriched.empty:
+        themes = sorted([t for t in scores_enriched["theme"].dropna().unique().tolist() if str(t).strip() != ""])
+    chosen_themes = []
+    if themes:
+        chosen_themes = st.sidebar.multiselect(
+            "Theme (optional)",
+            options=themes,
+            default=[],
+        )
+
     asof_dates = sorted(scores_enriched["asof_date"].dropna().unique())
+
+    # Apply universe filters to scores_enriched (and downstream views)
+    if "asset_type" in scores_enriched.columns and chosen_asset_types:
+        scores_enriched = scores_enriched[scores_enriched["asset_type"].isin(chosen_asset_types)].copy()
+    if "theme" in scores_enriched.columns and chosen_themes:
+        scores_enriched = scores_enriched[scores_enriched["theme"].isin(chosen_themes)].copy()
+
     chosen_date = st.sidebar.selectbox("As-of month-end", asof_dates, index=len(asof_dates) - 1)
 
     # Score mode toggle
@@ -641,7 +620,12 @@ def main() -> None:
 
         view = view.sort_values(rank_col, ascending=False).head(top_n)
 
-        cols = ["ticker", rank_col]
+        cols = ["ticker"]
+        if "asset_type" in view.columns:
+            cols.append("asset_type")
+        if "theme" in view.columns:
+            cols.append("theme")
+        cols.append(rank_col)
         cols += [b for b in BUCKET_COLS if b in view.columns]
         if "data_completeness" in view.columns:
             cols.append("data_completeness")
@@ -654,6 +638,13 @@ def main() -> None:
     with tabs[3]:
         st.subheader("Portfolio Holdings (Top-N selection)")
         port_view = portfolio[portfolio["asof_date"] == chosen_date].copy()
+
+        # Apply same universe filters to portfolio view
+        if "asset_type" in port_view.columns and chosen_asset_types:
+            port_view = port_view[port_view["asset_type"].isin(chosen_asset_types)].copy()
+        if "theme" in port_view.columns and chosen_themes:
+            port_view = port_view[port_view["theme"].isin(chosen_themes)].copy()
+
 
         if "action" in port_view.columns:
             action_filter = st.multiselect("Show actions", ["BUY", "HOLD", "SELL"], default=["BUY", "HOLD", "SELL"])
@@ -709,6 +700,15 @@ def main() -> None:
             s_hist = scores_enriched[scores_enriched["ticker"] == t].sort_values("asof_date").copy()
 
             st.write("Score + contribution history")
+
+            meta = {}
+            if "asset_type" in s_hist.columns and not s_hist["asset_type"].dropna().empty:
+                meta["Asset type"] = str(s_hist["asset_type"].dropna().iloc[-1])
+            if "theme" in s_hist.columns and not s_hist["theme"].dropna().empty:
+                meta["Theme"] = str(s_hist["theme"].dropna().iloc[-1])
+            if meta:
+                st.caption(" | ".join([f"{k}: {v}" for k, v in meta.items()]))
+
             cols = [
                 "asof_date",
                 "overall_score",
