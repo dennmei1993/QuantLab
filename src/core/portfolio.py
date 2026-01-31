@@ -30,7 +30,14 @@ def build_monthly_portfolio(
     """
     df = scores.copy()
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "asof_date",
+            "ticker",
+            "weight",
+            "score_used",
+            "score_col_used",
+            "index",
+        ])
 
     # Normalize key fields
     df["asof_date"] = pd.to_datetime(df["asof_date"]).dt.normalize()
@@ -87,26 +94,43 @@ def build_monthly_portfolio(
             "growth_score",
         ]
 
-        use_col = None
         needed = int(top_n)
+
+        # Pick a usable column.
+        # Prefer a column that can fill top_n, but if none can, take the one with the MOST coverage (>0).
+        use_col = None
+        best_col = None
+        best_non_null = 0
+
         for c in candidates:
-            if _non_null(g_all, c) >= needed:
+            nn = _non_null(g_all, c)
+            if nn >= needed:
                 use_col = c
+                best_non_null = nn
                 break
+            if nn > best_non_null:
+                best_non_null = nn
+                best_col = c
 
         if use_col is None:
+            use_col = best_col  # may still be None
+
+        if use_col is None or best_non_null == 0:
             # Nothing usable this month — skip safely
             continue
 
-        # Select top_n using the chosen column
+        # Build portfolio with as many names as available up to top_n
+        n_select = min(needed, best_non_null)
+
         g = (
             g_all.dropna(subset=[use_col])
             .sort_values(use_col, ascending=False)
-            .head(needed)
+            .head(n_select)
             .copy()
         )
         if g.empty:
             continue
+
 
         # Equal weights
         w = 1.0 / len(g)

@@ -150,3 +150,44 @@ def get_universe(name: str) -> list[str]:
         return _dedup_preserve_order(spx + n100 + extra)
 
     raise ValueError(f"Unknown universe name: {name}")
+
+
+# === New: STOCK/ETF universe loader ===
+
+def load_us_universe(path: Path) -> tuple[list[str], list[str], list[str], pd.DataFrame]:
+    """
+    Load a universe CSV that may contain:
+      - ticker (required)
+      - asset_type (optional): STOCK or ETF. Defaults to STOCK if missing/blank.
+
+    Returns:
+      (tickers_all, tickers_stock, tickers_etf, df_norm)
+    """
+    df = pd.read_csv(path)
+    if "ticker" not in df.columns:
+        raise ValueError(f"Universe CSV missing 'ticker' column: {path}")
+
+    df = df.copy()
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df = df[df["ticker"].notna() & (df["ticker"] != "")]
+
+    if "asset_type" not in df.columns:
+        df["asset_type"] = "STOCK"
+    df["asset_type"] = df["asset_type"].astype(str).str.strip().str.upper().replace({"": "STOCK", "NAN": "STOCK"})
+
+    # normalize to allowed values
+    df.loc[~df["asset_type"].isin(["STOCK", "ETF"]), "asset_type"] = "STOCK"
+
+    # de-duplicate by ticker, keep first occurrence (so you can override type if desired)
+    df = df.drop_duplicates(subset=["ticker"], keep="first").reset_index(drop=True)
+
+    tickers_all = df["ticker"].tolist()
+    tickers_stock = df.loc[df["asset_type"] == "STOCK", "ticker"].tolist()
+    tickers_etf = df.loc[df["asset_type"] == "ETF", "ticker"].tolist()
+
+    # preserve order but unique
+    tickers_all = _dedup_preserve_order(tickers_all)
+    tickers_stock = _dedup_preserve_order(tickers_stock)
+    tickers_etf = _dedup_preserve_order(tickers_etf)
+
+    return tickers_all, tickers_stock, tickers_etf, df

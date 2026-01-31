@@ -57,52 +57,82 @@ class YahooAdapter:
         end: pd.Timestamp
     ) -> pd.DataFrame:
         """
-        Fetch daily price history (Adjusted Close + Volume) via yfinance.
+        Fetch daily price history (Adj Close + Volume) via yfinance.
 
         Returns DataFrame with columns:
             ticker, date, adj_close, volume
 
-        NOTE: Supports canonical tickers like 'BRK.B' by mapping to Yahoo 'BRK-B'
-        while keeping output 'ticker' as canonical.
+        Notes / behavior:
+        - Supports canonical tickers like 'BRK.B' by mapping to Yahoo 'BRK-B' while keeping output ticker canonical.
+        - Best-effort: if some tickers fail (e.g., rate limits / delisted), we return what we can instead of raising.
+        - If everything fails, returns an **empty** DataFrame with the correct columns.
         """
         if yf is None:  # pragma: no cover
             raise ImportError(
                 "yfinance is not installed (or not available in this environment). "
-                "Activate your venv then run: pip install yfinance\n"
+                "Activate your venv then run: pip install yfinance"
                 f"Original import error: {_YF_IMPORT_ERROR}"
             )
 
-        canonical = [str(t).strip().upper() for t in tickers]
+        canonical = [str(t).strip().upper() for t in tickers if str(t).strip()]
+        if not canonical:
+            return pd.DataFrame(columns=["ticker", "date", "adj_close", "volume"])
+
         yahoo_tickers, yahoo_to_canon = _map_tickers_to_yahoo(canonical)
 
-        df = yf.download(
-            tickers=yahoo_tickers,
-            start=start.strftime("%Y-%m-%d"),
-            end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
-            auto_adjust=False,
-            progress=False,
-            group_by="column",
-            threads=True,
-        )
+        # yfinance can return empty (or raise) when rate-limited. We do a few retries.
+        max_attempts = int(getattr(self, "max_attempts", 4)) if hasattr(self, "max_attempts") else 4
+        base_sleep = float(getattr(self, "base_sleep_s", 2.0)) if hasattr(self, "base_sleep_s") else 2.0
 
-        if df is None or df.empty:
-            raise RuntimeError("yfinance returned empty price data.")
+        def _download(one_or_many: list[str]) -> pd.DataFrame:
+            last_err = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    df0 = yf.download(
+                        tickers=one_or_many,
+                        start=start.strftime("%Y-%m-%d"),
+                        end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                        auto_adjust=False,
+                        progress=False,
+                        group_by="column",
+                        threads=True,
+                    )
+                    return df0 if df0 is not None else pd.DataFrame()
+                except Exception as e:
+                    last_err = e
+                    msg = str(e)
+                    # Back off more aggressively on rate limits
+                    sleep_s = base_sleep * (2 ** (attempt - 1))
+                    if "Rate limit" in msg or "Too Many Requests" in msg or "YFRateLimitError" in msg:
+                        print(f"[YAHOO] Rate limited. Backing off {sleep_s:.1f}s (attempt {attempt}/{max_attempts})")
+                        time.sleep(sleep_s)
+                        continue
+                    # Unknown error: small backoff then retry
+                    print(f"[YAHOO] Error: {e}. Retrying in {sleep_s:.1f}s (attempt {attempt}/{max_attempts})")
+                    time.sleep(sleep_s)
+            if last_err is not None:
+                print(f"[YAHOO] Failed after {max_attempts} attempts: {last_err}")
+            return pd.DataFrame()
 
-        def to_long(frame: pd.DataFrame, field: str, out_name: str) -> pd.DataFrame:
+        def _to_long(frame: pd.DataFrame, field: str, out_name: str, yt_list: list[str]) -> pd.DataFrame:
             """
             Convert yfinance wide format to long format safely.
             Output columns: date, ticker, <out_name>
             """
+            if frame is None or frame.empty:
+                return pd.DataFrame(columns=["date", "ticker", out_name])
+
             if isinstance(frame.columns, pd.MultiIndex):
                 if field not in frame.columns.get_level_values(0):
-                    raise KeyError(f"Expected field '{field}' not found in yfinance MultiIndex columns.")
+                    return pd.DataFrame(columns=["date", "ticker", out_name])
                 sub = frame[field].copy()
             else:
+                # Single-ticker fallback (yfinance sometimes returns single-index columns)
                 if field not in frame.columns:
-                    raise KeyError(f"Expected column '{field}' not found.")
-                # Single-ticker fallback
+                    return pd.DataFrame(columns=["date", "ticker", out_name])
                 sub = frame[[field]].copy()
-                sub.columns = yahoo_tickers[:1]
+                # Ensure column name is the (single) yahoo ticker
+                sub.columns = yt_list[:1]
 
             long_df = sub.stack().rename(out_name).reset_index()
             cols = list(long_df.columns)
@@ -119,20 +149,46 @@ class YahooAdapter:
             )
             return long_df
 
-        adj_long = to_long(df, "Adj Close", "adj_close")
-        vol_long = to_long(df, "Volume", "volume")
+        # Strategy:
+        # - Try a batch download first (fast).
+        # - If empty, fall back to per-ticker (more resilient to partial failures).
+        df = _download(yahoo_tickers)
 
-        merged = adj_long.merge(vol_long, on=["date", "ticker"], how="inner")
-        merged = merged.dropna(subset=["adj_close"])
-        merged["volume"] = merged["volume"].fillna(0.0).astype(float)
+        frames = []
+        if df is not None and not df.empty:
+            adj_long = _to_long(df, "Adj Close", "adj_close", yahoo_tickers)
+            vol_long = _to_long(df, "Volume", "volume", yahoo_tickers)
+            merged = adj_long.merge(vol_long, on=["date", "ticker"], how="inner")
+            merged = merged.dropna(subset=["adj_close"])
+            if not merged.empty:
+                merged["volume"] = merged["volume"].fillna(0.0).astype(float)
+                frames.append(merged)
 
-        return merged.sort_values(["ticker", "date"]).reset_index(drop=True)
+        if not frames:
+            # Per-ticker fallback
+            for yt in yahoo_tickers:
+                df1 = _download([yt])
+                if df1 is None or df1.empty:
+                    # keep going; don't crash the pipeline
+                    continue
+                adj_long = _to_long(df1, "Adj Close", "adj_close", [yt])
+                vol_long = _to_long(df1, "Volume", "volume", [yt])
+                merged = adj_long.merge(vol_long, on=["date", "ticker"], how="inner")
+                merged = merged.dropna(subset=["adj_close"])
+                if merged.empty:
+                    continue
+                merged["volume"] = merged["volume"].fillna(0.0).astype(float)
+                frames.append(merged)
 
-    def fetch_fundamentals_quarterly(
-        self,
-        tickers: list[str],
-        availability_lag_days: int = 45
-    ) -> pd.DataFrame:
+        if not frames:
+            # Best-effort: return empty instead of raising.
+            return pd.DataFrame(columns=["ticker", "date", "adj_close", "volume"])
+
+        out = pd.concat(frames, ignore_index=True)
+        out = out.drop_duplicates(subset=["ticker", "date"], keep="last")
+        return out.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    def fetch_fundamentals_quarterly(self, tickers: list[str], availability_lag_days: int = 45) -> pd.DataFrame:
         """
         Best-effort quarterly fundamentals using yfinance statements.
 

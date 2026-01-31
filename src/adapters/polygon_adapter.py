@@ -6,6 +6,7 @@ import os
 import time
 import re
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -35,7 +36,7 @@ class PolygonAdapter:
     cache_dir: Path
     api_key_env: str = "POLYGON_API_KEY"
     base_url: str = "https://api.polygon.io"
-    requests_per_minute: int = 30
+    requests_per_minute: int = 2
     max_retries: int = 10
 
     def _record_empty_ticker(self, ticker: str) -> None:
@@ -109,6 +110,7 @@ class PolygonAdapter:
 
         for attempt in range(self.max_retries):
             self._rate_limit_wait()
+
             resp = self._session.get(url, params=params, timeout=60)
             self._last_call_ts = time.time()
             last_text = resp.text
@@ -236,6 +238,16 @@ class PolygonAdapter:
         """
         start = pd.to_datetime(start).normalize()
         end = pd.to_datetime(end).normalize()
+        # Clamp end date to today to avoid querying future ranges (Polygon returns empty / errors).
+        today = pd.Timestamp.today().normalize()
+        end_was_future = bool(end > today)
+        if end_was_future:
+            print(f"[Polygon] End date {end.date()} is in the future; clamping to today {today.date()}.")
+            end = today
+        if start > end:
+            raise RuntimeError(f"Requested price range is entirely in the future: {start.date()}..{end.date()}")
+        range_days = int((end - start).days)
+
         start_s = start.strftime("%Y-%m-%d")
         end_s = end.strftime("%Y-%m-%d")
 
@@ -264,11 +276,22 @@ class PolygonAdapter:
 
             # 4) otherwise call API and save exact cache
             df_new = self._fetch_one_ticker_range(t, start_s, end_s, adjusted)
+
             if df_new.empty:
                 print(f"[Polygon] {t}: empty response for {start_s}..{end_s}")
-                self._record_empty_ticker(t)
+                # Avoid falsely flagging 'empty' tickers when the requested range includes future dates
+                # or when the range is very short (new listings, holidays, etc.).
+                if (not end_was_future) and (range_days >= 20):
+                    self._record_empty_ticker(t)
+                else:
+                    if end_was_future:
+                        print(f"[Polygon] {t}: skipped empty_tickers.csv because end date was future-clamped.")
+                    else:
+                        print(f"[Polygon] {t}: skipped empty_tickers.csv because range_days={range_days} < 20.")
                 continue
-
+            else:
+                print(f"[Polygon] {t}: fetched {len(df_new):,} rows for {start_s}..{end_s}")
+            
             if use_cache:
                 try:
                     df_new.to_parquet(exact, index=False)

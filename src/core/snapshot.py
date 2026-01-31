@@ -32,7 +32,11 @@ def build_monthly_snapshots(
     tickers: list[str],
     prices_daily: pd.DataFrame,
     fundamentals_quarterly: pd.DataFrame,
+    asset_type_map: dict[str, str] | None = None,   # ✅ default
+    theme_map: dict[str, str] | None = None,        # ✅ default
 ) -> pd.DataFrame:
+
+
     """
     Creates a monthly snapshot per ticker containing:
       - asof_date (the *last available trading day <= calendar month_end*, per ticker)
@@ -40,6 +44,10 @@ def build_monthly_snapshots(
       - adj_close at asof_date
       - latest available fundamentals as of asof_date (no look-ahead)
     """
+
+    asset_type_map = asset_type_map or {}
+    theme_map = theme_map or {}
+
     if prices_daily is None or prices_daily.empty:
         return pd.DataFrame()
 
@@ -84,12 +92,31 @@ def build_monthly_snapshots(
             if not np.isfinite(px):
                 continue
 
-            fund = _latest_fundamental_asof(fundamentals_quarterly, key, d_use)
+            fund = _latest_fundamental_asof(fundamentals_quarterly, t, d_use)
+
+            # If no fundamentals (common for ETFs), keep a price-only snapshot
+            if fund is None or (hasattr(fund, "empty") and fund.empty):
+                fund_dict = {}
+            else:
+                fund_dict = fund.to_dict() if hasattr(fund, "to_dict") else dict(fund)  
+
+            row = {
+                "asof_date": d_use,
+                "ticker": t,
+                # ... price fields you already set ...
+            }
+
+    # Add fundamentals if present (otherwise stays NaN)
+
+            row.update(fund_dict)
+
+            rows.append(row)
 
             rec = {
                 "asof_date": d_use,      # trading day actually used for pricing (<= month_end)
                 "month_end": month_end,  # calendar month end (audit)
                 "ticker": key,
+                "asset_type": asset_type_map.get(key, "STOCK"),
                 "adj_close": float(px),
             }
 

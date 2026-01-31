@@ -54,7 +54,23 @@ def run_backtest(
     # Portfolio file may include BUY/HOLD/SELL rows for UI.
     # Backtest should only consider active positions (weight > 0).
 
+    
     port = portfolio.copy()
+
+    # --- Guard rails: empty portfolio / missing columns ---
+    required_cols = {"asof_date", "ticker"}
+    if port is None or port.empty:
+        raise RuntimeError(
+            "Portfolio is empty — cannot backtest. "
+            "This usually means scoring produced no investable tickers for the chosen window."
+        )
+    missing = required_cols - set(port.columns)
+    if missing:
+        raise RuntimeError(
+            f"Portfolio missing required columns: {sorted(missing)}. "
+            f"Columns present: {list(port.columns)}"
+        )
+
     if "weight" in port.columns:
         port = port[port["weight"] > 0.0].copy()
 

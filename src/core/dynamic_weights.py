@@ -12,6 +12,22 @@ def _norm_date(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s).dt.normalize()
 
 
+
+def _safe_corr(x: pd.Series, y: pd.Series) -> float:
+    """Return Pearson correlation or NaN without emitting divide warnings.
+    - Requires at least 2 distinct values in each series after alignment.
+    """
+    m = x.notna() & y.notna()
+    if int(m.sum()) < 2:
+        return float("nan")
+    xx = x[m].astype(float)
+    yy = y[m].astype(float)
+    # If either is constant -> corr is undefined (std==0)
+    if xx.nunique(dropna=True) < 2 or yy.nunique(dropna=True) < 2:
+        return float("nan")
+    return float(xx.corr(yy))
+
+
 def compute_forward_returns_monthly(
     scores: pd.DataFrame,
     prices_daily: pd.DataFrame,
@@ -120,6 +136,12 @@ def compute_monthly_ic(
     df = s.merge(f[["asof_date", "ticker", ycol]], on=["asof_date", "ticker"], how="left")
     df = df.dropna(subset=[ycol])
 
+    # Exclude ETFs from IC estimation (IC should be based on single-name equities only).
+    # If asset_type is present, keep only STOCK rows for IC calc.
+    if "asset_type" in df.columns:
+        df = df[df["asset_type"].astype(str).str.upper() == "STOCK"].copy()
+
+
     recs = []
     for d, g in df.groupby("asof_date"):
         y = g[ycol].astype(float)
@@ -142,18 +164,19 @@ def compute_monthly_ic(
             if int(m.sum()) < int(min_n):
                 rec[f"ic_{b}"] = np.nan
             else:
-                rec[f"ic_{b}"] = float(rx[m].corr(ry[m]))
+                rec[f"ic_{b}"] = _safe_corr(rx, ry)
 
         if "overall_score_ai" in g.columns:
             x = g["overall_score_ai"].astype(float)
             rx = x.rank(pct=True) if method.lower() == "spearman" else x
             m = rx.notna() & ry.notna()
-            rec["ic_overall_score_ai"] = float(rx[m].corr(ry[m])) if int(m.sum()) >= int(min_n) else np.nan
+            rec["ic_overall_score_ai"] = _safe_corr(rx, ry) if int(m.sum()) >= int(min_n) else np.nan
 
         recs.append(rec)
 
     out = pd.DataFrame(recs).sort_values("asof_date").reset_index(drop=True)
     return out
+
 
 def compute_dynamic_bucket_weights(
     monthly_ic: pd.DataFrame,
@@ -163,12 +186,10 @@ def compute_dynamic_bucket_weights(
     """
     Convert monthly IC history into dynamic bucket weights per month.
 
-    Option B implementation:
-      - Use EXPANDING mean IC (min_periods=3) for early months
-      - Switch to ROLLING mean over last `window_months` once enough history exists
-      - Clip negative IC to 0
-      - Normalize to sum=1
-      - Apply floor `min_weight` then renormalize
+    - rolling mean IC over last `window_months`
+    - clip negative IC to 0
+    - normalize to sum=1
+    - apply a floor `min_weight` then renormalize
     """
     if monthly_ic.empty:
         return pd.DataFrame(columns=["asof_date"] + WCOLS)
@@ -178,34 +199,20 @@ def compute_dynamic_bucket_weights(
     ic = ic.sort_values("asof_date").reset_index(drop=True)
 
     # Coerce IC columns to numeric (defensive against NaT/object contamination)
-    ic_cols = []
     for b in BUCKETS:
         c = f"ic_{b}"
         ic[c] = pd.to_numeric(ic.get(c, np.nan), errors="coerce")
-        ic_cols.append(c)
 
-    ic_df = ic.set_index("asof_date")[ic_cols].copy()
-
-    # Expanding mean for early periods (min 3 points)
-    exp_mean = ic_df.expanding(min_periods=3).mean()
-
-    # Rolling mean for mature periods
-    roll_mean = ic_df.rolling(window=int(window_months), min_periods=3).mean()
-
-    # Determine per-column when we have enough VALID points to use rolling
-    # Use rolling count (min_periods=1) to measure available observations in last window
-    roll_count = ic_df.rolling(window=int(window_months), min_periods=1).count()
-
-    # Use rolling mean when count >= window_months, else expanding mean
-    use_roll = roll_count >= float(window_months)
-    blended = roll_mean.where(use_roll, exp_mean)
-
-    roll = blended.reset_index()  # columns: asof_date + ic_* rolling/expanding blend
+    roll = (
+        ic.set_index("asof_date")[[f"ic_{b}" for b in BUCKETS]]
+        .rolling(window=int(window_months), min_periods=3)
+        .mean()
+        .reset_index()
+    )
 
     w_recs = []
     for _, r in roll.iterrows():
         d = r["asof_date"]
-
         vals = np.array(
             [pd.to_numeric(r.get(f"ic_{b}", np.nan), errors="coerce") for b in BUCKETS],
             dtype=float,
@@ -215,13 +222,11 @@ def compute_dynamic_bucket_weights(
         vals = np.nan_to_num(vals, nan=0.0)
         vals = np.clip(vals, 0.0, None)
 
-        # If all ICs are non-positive / missing, use equal weights
         if vals.sum() <= 0:
             w = np.array([0.25, 0.25, 0.25, 0.25], dtype=float)
         else:
             w = vals / vals.sum()
 
-        # Enforce minimum weight floor, then renormalize
         w = np.maximum(w, float(min_weight))
         w = w / w.sum()
 
@@ -237,7 +242,6 @@ def compute_dynamic_bucket_weights(
 
     out = pd.DataFrame(w_recs).sort_values("asof_date").reset_index(drop=True)
     return out
-
 
 
 def apply_dynamic_overall_score(
@@ -313,7 +317,9 @@ def apply_dynamic_overall_score(
     w_sum = w_eff.sum(axis=1)
 
     num = (np.nan_to_num(bmat.values, nan=0.0) * w_eff).sum(axis=1)
-    out["overall_score_ai"] = np.where(w_sum > 0, num / w_sum, np.nan)
+    overall = np.full(num.shape, np.nan, dtype="float64")
+    np.divide(num, w_sum, out=overall, where=(w_sum > 0) & np.isfinite(w_sum))
+    out["overall_score_ai"] = overall
     # --------------------------------------------------------------------------------------------
 
     # (optional) contribution columns (NaN-safe: missing bucket -> 0 contribution)
