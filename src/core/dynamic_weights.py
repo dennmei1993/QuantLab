@@ -106,6 +106,107 @@ def compute_forward_returns_monthly(
     return merged[["asof_date", "ticker", f"fwd_ret_{horizon_months}m"]]
 
 
+def compute_forward_returns_by_months(
+    scores: pd.DataFrame,
+    prices_daily: pd.DataFrame,
+    horizon_months: int,
+    price_col: str = "adj_close",
+) -> pd.DataFrame:
+    """Compute forward returns using a *true* date offset.
+
+    This is required when your `scores` are not strictly monthly (e.g. weekly).
+    For each (asof_date, ticker), the forward price is taken on the first
+    available trading day **on or after** (asof_date + horizon_months).
+
+    Output columns:
+      - asof_date
+      - ticker
+      - fwd_ret_{horizon_months}m
+    """
+    if scores.empty or prices_daily.empty:
+        return pd.DataFrame(columns=["asof_date", "ticker", f"fwd_ret_{horizon_months}m"])
+
+    s = scores[["asof_date", "ticker"]].copy()
+    s["asof_date"] = _norm_date(s["asof_date"])
+    s["ticker"] = s["ticker"].astype(str)
+    s["target_date"] = s["asof_date"] + pd.DateOffset(months=int(horizon_months))
+
+    p = prices_daily.copy()
+    if "date" in p.columns:
+        p["date"] = _norm_date(p["date"])
+        dcol = "date"
+    elif "Date" in p.columns:
+        p["Date"] = _norm_date(p["Date"])
+        dcol = "Date"
+    else:
+        raise ValueError("prices_daily must contain a 'date' (or 'Date') column")
+
+    if "ticker" not in p.columns:
+        raise ValueError("prices_daily must contain a 'ticker' column")
+    if price_col not in p.columns:
+        raise ValueError(f"prices_daily must contain '{price_col}' column")
+    p["ticker"] = p["ticker"].astype(str)
+
+    tickers = s["ticker"].unique().tolist()
+    p = p[p["ticker"].isin(tickers)].sort_values(["ticker", dcol]).copy()
+
+    # Build per-ticker forward merge (direction='forward')
+    out_rows = []
+    for t, g in s.groupby("ticker"):
+        gt = g.sort_values("asof_date").copy()
+        pt = (
+            p[p["ticker"] == t]
+            .sort_values(dcol)[[dcol, price_col]]
+            .rename(columns={dcol: "date", price_col: "px"})
+        )
+        if pt.empty:
+            gt["px0"] = np.nan
+            gt["px_fwd"] = np.nan
+        else:
+            # px0: last available on/before asof_date
+            px0 = pd.merge_asof(
+                gt[["asof_date"]].sort_values("asof_date"),
+                pt.sort_values("date"),
+                left_on="asof_date",
+                right_on="date",
+                direction="backward",
+            )["px"].to_numpy()
+
+            # px_fwd: first available on/after target_date
+            pxf = pd.merge_asof(
+                gt[["target_date"]].sort_values("target_date"),
+                pt.sort_values("date"),
+                left_on="target_date",
+                right_on="date",
+                direction="forward",
+            )["px"].to_numpy()
+
+            gt["px0"] = px0
+            gt["px_fwd"] = pxf
+        out_rows.append(gt[["asof_date", "ticker", "px0", "px_fwd"]])
+
+    merged = pd.concat(out_rows, ignore_index=True)
+    merged[f"fwd_ret_{horizon_months}m"] = (merged["px_fwd"] / merged["px0"]) - 1.0
+    return merged[["asof_date", "ticker", f"fwd_ret_{horizon_months}m"]]
+
+
+def compute_dynamic_bucket_weights_periodic(
+    ic_by_period: pd.DataFrame,
+    window_periods: int = 52,
+    min_weight: float = 0.05,
+) -> pd.DataFrame:
+    """Periodic version of compute_dynamic_bucket_weights.
+
+    The original function's `window_months` parameter is really a *row window*.
+    For weekly engines, pass `window_periods=52` (approx 1 year).
+    """
+    return compute_dynamic_bucket_weights(
+        ic_by_period,
+        window_months=int(window_periods),
+        min_weight=float(min_weight),
+    )
+
+
 def compute_monthly_ic(
     scores: pd.DataFrame,
     fwd: pd.DataFrame,
