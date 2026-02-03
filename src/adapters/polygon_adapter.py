@@ -101,32 +101,90 @@ class PolygonAdapter:
             time.sleep(self._min_interval_s - elapsed)
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        """GET with retry/backoff on 429."""
+        """GET with retry/backoff on 429 AND network failures.
+
+        Retries:
+        - HTTP 429 (rate limit)
+        - HTTP 5xx (transient server errors)
+        - network-level failures (ConnectionError / Timeout / ChunkedEncodingError)
+
+        Notes:
+        - Uses timeout=(connect, read)
+        - Refreshes session periodically to avoid stale keep-alive sockets
+        """
         url = self.base_url.rstrip("/") + path
         params = dict(params)
         params["apiKey"] = self.api_key
 
+        last_err: Optional[Exception] = None
         last_text: Optional[str] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                self._rate_limit_wait()
 
-        for attempt in range(self.max_retries):
-            self._rate_limit_wait()
+                resp = self._session.get(
+                    url,
+                    params=params,
+                    timeout=(10, 60),  # connect, read
+                )
+                self._last_call_ts = time.time()
+                last_text = resp.text
 
-            resp = self._session.get(url, params=params, timeout=60)
-            self._last_call_ts = time.time()
-            last_text = resp.text
+                if resp.status_code == 200:
+                    return resp.json()
 
-            if resp.status_code == 200:
-                return resp.json()
+                if resp.status_code == 429:
+                    wait = min(60, (2 ** attempt) * 2)
+                    print(
+                        "[Polygon] 429 rate limit. Backing off {}s (attempt {}/{})".format(
+                            wait, attempt, self.max_retries
+                        )
+                    )
+                    time.sleep(wait)
+                    continue
 
-            if resp.status_code == 429:
-                wait = min(60, (2 ** attempt) * 2)
-                print(f"[Polygon] 429 rate limit. Backing off {wait}s (attempt {attempt+1}/{self.max_retries})")
+                if 500 <= resp.status_code < 600:
+                    wait = min(60, 2 ** attempt)
+                    print(
+                        "[Polygon] {} server error. Retrying in {}s (attempt {}/{})".format(
+                            resp.status_code, wait, attempt, self.max_retries
+                        )
+                    )
+                    time.sleep(wait)
+                    continue
+
+                raise RuntimeError(
+                    "Polygon API error {}: {}".format(resp.status_code, resp.text[:300])
+                )
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as e:
+                last_err = e
+                wait = min(60, 2 ** attempt) + 0.5
+                print(
+                    "[Polygon] network error: {}. Retrying in {:.1f}s (attempt {}/{})".format(
+                        e, wait, attempt, self.max_retries
+                    )
+                )
                 time.sleep(wait)
-                continue
 
-            raise RuntimeError(f"Polygon API error {resp.status_code}: {resp.text[:300]}")
+                # Refresh session to kill stale keep-alive sockets
+                if attempt in (3, 6):
+                    try:
+                        self._session.close()
+                    except Exception:
+                        pass
+                    self._session = requests.Session()
+        raise RuntimeError(
+            "Polygon request failed after {} retries. Last error={}, last response={}".format(
+                self.max_retries, last_err, (last_text or "")[:300]
+            )
+        )
 
-        raise RuntimeError(f"Polygon API retry exhausted. Last response: {(last_text or '')[:300]}")
+
 
     def _cache_suffix(self, adjusted: bool) -> str:
         return "__adj.parquet" if adjusted else ".parquet"
